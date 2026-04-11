@@ -5,10 +5,13 @@ use bindings::exports::near::agent::tool::{Guest, Request, Response};
 use bindings::near::agent::host;
 
 use serde::{Deserialize, Serialize};
-use blake2::{Blake2b256, Digest};
+use blake2::{Blake2b, Digest};
+use blake2::digest::consts::U32;
+type Blake2b256 = Blake2b<U32>;
+
 use k256::{
     Scalar, FieldBytes,
-    elliptic_curve::{PrimeField, ops::Reduce},
+    elliptic_curve::PrimeField,
     schnorr::{SigningKey, Signature},
     schnorr::signature::Signer,
 };
@@ -427,7 +430,7 @@ fn http_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
         "POST",
         url,
         headers,
-        Some(body.as_bytes().to_vec()),
+        Some(body.as_bytes()),
         Some(30_000),
     ).map_err(|e| format!("http error: {}", e))?;
     if resp.status < 200 || resp.status >= 300 {

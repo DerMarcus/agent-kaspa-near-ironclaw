@@ -7,8 +7,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# WIT bindgen (cargo-component injects the right version; pin explicitly to be safe)
-wit-bindgen = { version = "0.36", default-features = false }
+# WIT bindgen — must include realloc feature for WASM component model runtime
+wit-bindgen = { version = "0.36", features = ["realloc"] }
 
 # Serialisation
 serde = { version = "1", features = ["derive"] }
