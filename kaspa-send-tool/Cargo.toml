@@ -7,35 +7,34 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
+# WIT bindgen (cargo-component injects the right version; pin explicitly to be safe)
+wit-bindgen = { version = "0.36", default-features = false }
+
+# Serialisation
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console"] }
 
-# BIP39 mnemonic handling
+# BIP39 mnemonic
 bip39 = "2"
 
-# HD derivation + secp256k1 Schnorr signing
-bitcoin = { version = "0.31", default-features = false, features = ["secp-recovery"] }
-secp256k1 = { version = "0.28", features = ["rand"] }
+# secp256k1 Schnorr signing (needs clang for C backend; clang is available on this host)
+secp256k1 = { version = "0.28", features = ["rand", "global-context"] }
 
-# Blake2b hashing (Kaspa sighash)
+# Blake2b-256 for Kaspa sighash
 blake2 = "0.10"
 
 # Hex encoding
 hex = "0.4"
 
-# HTTP (WASM-compatible)
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
-
 # HMAC-SHA512 for BIP32 key derivation
 hmac = "0.12"
 sha2 = "0.10"
 
-# serde ↔ wasm_bindgen bridge
-serde-wasm-bindgen = "0.6"
+[package.metadata.component]
+package = "kaspa:send@0.1.0"
+
+[package.metadata.component.target]
+world = "kaspa-send-world"
 
 [profile.release]
-opt-level = "s"   # minimise WASM size
+opt-level = "s"

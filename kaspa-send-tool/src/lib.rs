@@ -1,124 +1,123 @@
-use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+#[allow(warnings)]
+mod bindings;
+
+use bindings::exports::near::agent::tool::{Guest, Request, Response};
+use bindings::near::agent::host;
+
 use serde::{Deserialize, Serialize};
-use blake2::{Blake2b, Digest};
+use blake2::{Blake2b256, Digest};
 use secp256k1::{Secp256k1, SecretKey, PublicKey, Message};
 use bip39::Mnemonic;
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
-// Public API types
+// Tool input/output types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
-pub struct SendParams {
-    pub recipient: String,
-    pub amount_kas: f64,
-    pub priority_fee_sompi: u64,
+#[derive(Deserialize)]
+struct SendParams {
+    recipient: String,
+    amount_kas: f64,
+    #[serde(default)]
+    priority_fee_sompi: u64,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct TxResult {
-    pub txid: String,
-    pub status: String,
+#[derive(Serialize)]
+struct TxResult {
+    txid: String,
+    status: String,
 }
 
 // ---------------------------------------------------------------------------
-// Internal types mirroring Kaspa REST API shapes
+// Kaspa REST API types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct UtxoEntry {
-    #[serde(rename = "outpoint")]
-    pub outpoint: Outpoint,
+#[derive(Deserialize, Clone)]
+struct UtxoEntry {
+    outpoint: Outpoint,
     #[serde(rename = "utxoEntry")]
-    pub entry: UtxoData,
+    entry: UtxoData,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Outpoint {
-    #[serde(rename = "transactionId")]
-    pub transaction_id: String,
-    pub index: u32,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct UtxoData {
-    pub amount: String, // sompi as string in API response
-    #[serde(rename = "scriptPublicKey")]
-    pub script_public_key: ScriptPublicKey,
-    #[serde(rename = "blockDaaScore")]
-    pub block_daa_score: String,
-    #[serde(rename = "isCoinbase")]
-    pub is_coinbase: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ScriptPublicKey {
-    #[serde(rename = "scriptPublicKey")]
-    pub script: String, // hex-encoded script
-    pub version: u16,
-}
-
-// Kaspa REST API transaction submission structures
-#[derive(Serialize, Deserialize)]
-struct KaspaTransactionInput {
-    #[serde(rename = "previousOutpoint")]
-    previous_outpoint: PreviousOutpoint,
-    #[serde(rename = "signatureScript")]
-    signature_script: String, // hex
-    sequence: u64,
-    #[serde(rename = "sigOpCount")]
-    sig_op_count: u8,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PreviousOutpoint {
+#[derive(Deserialize, Clone)]
+struct Outpoint {
     #[serde(rename = "transactionId")]
     transaction_id: String,
     index: u32,
 }
 
-#[derive(Serialize, Deserialize)]
-struct KaspaTransactionOutput {
-    amount: u64,
+#[derive(Deserialize, Clone)]
+struct UtxoData {
+    amount: String,
     #[serde(rename = "scriptPublicKey")]
-    script_public_key: ScriptPublicKeyOut,
+    script_public_key: ScriptPublicKey,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ScriptPublicKeyOut {
-    version: u16,
+#[derive(Deserialize, Clone)]
+struct ScriptPublicKey {
     #[serde(rename = "scriptPublicKey")]
-    script: String, // hex
+    script: String,
+    version: u16,
 }
 
-#[derive(Serialize, Deserialize)]
-struct KaspaTransaction {
+#[derive(Serialize)]
+struct SubmitTxRequest {
+    transaction: KaspaTx,
+    #[serde(rename = "allowOrphan")]
+    allow_orphan: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct KaspaTx {
     version: u16,
-    inputs: Vec<KaspaTransactionInput>,
-    outputs: Vec<KaspaTransactionOutput>,
+    inputs: Vec<TxInput>,
+    outputs: Vec<TxOutput>,
     #[serde(rename = "lockTime")]
     lock_time: u64,
     #[serde(rename = "subnetworkId")]
     subnetwork_id: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SubmitTxRequest {
-    transaction: KaspaTransaction,
-    #[serde(rename = "allowOrphan")]
-    allow_orphan: bool,
+#[derive(Serialize, Clone)]
+struct TxInput {
+    #[serde(rename = "previousOutpoint")]
+    previous_outpoint: PreviousOutpoint,
+    #[serde(rename = "signatureScript")]
+    signature_script: String,
+    sequence: u64,
+    #[serde(rename = "sigOpCount")]
+    sig_op_count: u8,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Clone)]
+struct PreviousOutpoint {
+    #[serde(rename = "transactionId")]
+    transaction_id: String,
+    index: u32,
+}
+
+#[derive(Serialize, Clone)]
+struct TxOutput {
+    amount: u64,
+    #[serde(rename = "scriptPublicKey")]
+    script_public_key: ScriptPublicKeyOut,
+}
+
+#[derive(Serialize, Clone)]
+struct ScriptPublicKeyOut {
+    version: u16,
+    #[serde(rename = "scriptPublicKey")]
+    script: String,
+}
+
+#[derive(Deserialize)]
 struct SubmitTxResponse {
     #[serde(rename = "transactionId")]
     transaction_id: String,
 }
 
 // ---------------------------------------------------------------------------
-// Key material
+// Keypair
 // ---------------------------------------------------------------------------
 
 struct KaspaKeypair {
@@ -128,19 +127,18 @@ struct KaspaKeypair {
 }
 
 // ---------------------------------------------------------------------------
-// Kaspa address encoding
-//
-// Kaspa uses a custom bech32-like encoding:
-//   - HRP: "kaspa" (mainnet)
-//   - Payload: version_byte (0x00 for P2PK Schnorr) + 32-byte x-only pubkey
+// Kaspa address encoding (bech32-like, version 0 = P2PK Schnorr)
 // ---------------------------------------------------------------------------
 
+const CHARSET: [char; 32] = [
+    'q','p','z','r','y','9','x','8','g','f','2','t','v','d','w','0',
+    's','3','j','n','5','4','k','h','c','e','6','m','u','a','7','l',
+];
+
 fn encode_kaspa_address(pubkey: &PublicKey) -> String {
-    let xonly = &pubkey.serialize()[1..]; // drop 02/03 prefix → 32 bytes
-    // version byte 0 = P2PK (Schnorr)
-    let mut payload = vec![0u8];
+    let xonly = &pubkey.serialize()[1..]; // 32-byte x-only
+    let mut payload = vec![0u8]; // version 0 = P2PK Schnorr
     payload.extend_from_slice(xonly);
-    // 5-bit base32 conversion
     let b32 = to_base32(&payload);
     let checksum = kaspa_checksum("kaspa", &b32);
     let mut chars: Vec<char> = b32.iter().map(|b| CHARSET[*b as usize]).collect();
@@ -149,11 +147,6 @@ fn encode_kaspa_address(pubkey: &PublicKey) -> String {
     }
     format!("kaspa:{}", chars.iter().collect::<String>())
 }
-
-const CHARSET: [char; 32] = [
-    'q','p','z','r','y','9','x','8','g','f','2','t','v','d','w','0',
-    's','3','j','n','5','4','k','h','c','e','6','m','u','a','7','l',
-];
 
 fn to_base32(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
@@ -199,40 +192,37 @@ fn polymod_step(pre: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// p2pk script helpers
+// P2PK script helpers
 // ---------------------------------------------------------------------------
 
 fn p2pk_script(pubkey: &PublicKey) -> String {
-    // OP_DATA_32 <xonly_pubkey_32_bytes> OP_CHECKSIG
-    // Kaspa P2PK: 0x20 <32-byte xonly pubkey> 0xac
-    let xonly = &pubkey.serialize()[1..];
+    // 0x20 <32-byte xonly> 0xac
     let mut script = vec![0x20u8];
-    script.extend_from_slice(xonly);
+    script.extend_from_slice(&pubkey.serialize()[1..]);
     script.push(0xac);
     hex::encode(script)
 }
 
-fn address_to_script(address: &str) -> Result<(u16, String), JsValue> {
-    // Strip "kaspa:" prefix and decode
+fn address_to_script(address: &str) -> Result<(u16, String), String> {
     let addr = address
         .strip_prefix("kaspa:")
-        .ok_or_else(|| JsValue::from_str("invalid address: missing kaspa: prefix"))?;
+        .ok_or("invalid address: missing kaspa: prefix")?;
 
-    // Decode bech32 chars to 5-bit values
-    let b32: Result<Vec<u8>, _> = addr.chars().map(|c| {
-        CHARSET.iter().position(|&x| x == c)
-            .map(|p| p as u8)
-            .ok_or_else(|| JsValue::from_str("invalid address char"))
-    }).collect();
+    let b32: Result<Vec<u8>, _> = addr
+        .chars()
+        .map(|c| {
+            CHARSET.iter().position(|&x| x == c)
+                .map(|p| p as u8)
+                .ok_or_else(|| format!("invalid char '{}'", c))
+        })
+        .collect();
     let b32 = b32?;
 
-    // Last 8 values are checksum — strip them
     if b32.len() < 9 {
-        return Err(JsValue::from_str("address too short"));
+        return Err("address too short".into());
     }
     let payload_b32 = &b32[..b32.len() - 8];
 
-    // Convert 5-bit to 8-bit
     let mut result = Vec::new();
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
@@ -246,13 +236,11 @@ fn address_to_script(address: &str) -> Result<(u16, String), JsValue> {
     }
 
     if result.is_empty() {
-        return Err(JsValue::from_str("empty address payload"));
+        return Err("empty address payload".into());
     }
 
     let version = result[0] as u16;
     let pubkey_bytes = &result[1..];
-
-    // Build P2PK script: 0x20 <32 bytes> 0xac
     let mut script = vec![0x20u8];
     script.extend_from_slice(pubkey_bytes);
     script.push(0xac);
@@ -260,36 +248,27 @@ fn address_to_script(address: &str) -> Result<(u16, String), JsValue> {
 }
 
 // ---------------------------------------------------------------------------
-// Key derivation
+// BIP32 key derivation  (m/44'/111111'/0'/0/0  — Kaspa coin type 111111)
 // ---------------------------------------------------------------------------
 
-fn derive_kaspa_keypair(mnemonic_phrase: &str) -> Result<KaspaKeypair, JsValue> {
+fn derive_kaspa_keypair(mnemonic_phrase: &str) -> Result<KaspaKeypair, String> {
     let mnemonic = Mnemonic::from_str(mnemonic_phrase)
-        .map_err(|e| JsValue::from_str(&format!("invalid mnemonic: {}", e)))?;
-
+        .map_err(|e| format!("invalid mnemonic: {}", e))?;
     let seed = mnemonic.to_seed("");
-
-    // BIP44 derivation: m/44'/111111'/0'/0/0
-    // Manually derive using HMAC-SHA512 (BIP32)
     let secret_key = derive_bip32_key(&seed)?;
-
     let secp = Secp256k1::new();
     let public_key = PublicKey::from_secret_key(&secp, &secret_key);
     let address = encode_kaspa_address(&public_key);
-
     Ok(KaspaKeypair { secret_key, public_key, address })
 }
 
-/// Minimal BIP32 derivation for path m/44'/111111'/0'/0/0
-fn derive_bip32_key(seed: &[u8]) -> Result<SecretKey, JsValue> {
+fn derive_bip32_key(seed: &[u8]) -> Result<SecretKey, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
-
     type HmacSha512 = Hmac<Sha512>;
 
-    // Master key
     let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed")
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     mac.update(seed);
     let result = mac.finalize().into_bytes();
     let (mut key_bytes, mut chain_code): ([u8; 32], [u8; 32]) = (
@@ -297,254 +276,200 @@ fn derive_bip32_key(seed: &[u8]) -> Result<SecretKey, JsValue> {
         result[32..].try_into().unwrap(),
     );
 
-    // Path: 44' = 0x8000002C, 111111' = 0x8001B207, 0' = 0x80000000, 0, 0
-    let path: &[u32] = &[
-        0x8000_002C,
-        0x8001_B207,
-        0x8000_0000,
-        0,
-        0,
-    ];
-
+    // m/44'/111111'/0'/0/0
+    let path: &[u32] = &[0x8000_002C, 0x8001_B207, 0x8000_0000, 0, 0];
     let secp = Secp256k1::new();
 
     for &index in path {
         let mut data = Vec::with_capacity(37);
         if index >= 0x8000_0000 {
-            // Hardened: 0x00 || key
             data.push(0x00);
             data.extend_from_slice(&key_bytes);
         } else {
-            // Normal: serialized compressed pubkey
-            let sk = SecretKey::from_slice(&key_bytes)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let sk = SecretKey::from_slice(&key_bytes).map_err(|e| e.to_string())?;
             let pk = PublicKey::from_secret_key(&secp, &sk);
             data.extend_from_slice(&pk.serialize());
         }
         data.extend_from_slice(&index.to_be_bytes());
 
         let mut child_mac = HmacSha512::new_from_slice(&chain_code)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .map_err(|e| e.to_string())?;
         child_mac.update(&data);
         let child_result = child_mac.finalize().into_bytes();
 
-        // child_key = parse256(IL) + parent_key (mod n)
         let il: [u8; 32] = child_result[..32].try_into().unwrap();
         chain_code = child_result[32..].try_into().unwrap();
 
-        let mut child_sk = SecretKey::from_slice(&il)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        child_sk = child_sk.add_tweak(&secp256k1::Scalar::from_be_bytes(key_bytes).unwrap())
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        key_bytes = *child_sk.as_ref();
+        let child_sk = SecretKey::from_slice(&il).map_err(|e| e.to_string())?;
+        let parent_sk = SecretKey::from_slice(&key_bytes).map_err(|e| e.to_string())?;
+        let tweaked = child_sk.add_tweak(
+            &secp256k1::Scalar::from_be_bytes(parent_sk.secret_bytes()).unwrap()
+        ).map_err(|e| e.to_string())?;
+        key_bytes = tweaked.secret_bytes();
     }
 
-    SecretKey::from_slice(&key_bytes)
-        .map_err(|e| JsValue::from_str(&e.to_string()))
+    SecretKey::from_slice(&key_bytes).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
-// UTXO fetching
+// Kaspa sighash (SIGHASH_ALL, Blake2b-256)
 // ---------------------------------------------------------------------------
 
-async fn fetch_utxos(address: &str) -> Result<Vec<UtxoEntry>, JsValue> {
-    use web_sys::{Request, RequestInit, RequestMode, Response};
-    use wasm_bindgen::JsCast;
+fn kaspa_sighash(tx: &KaspaTx, input_index: usize, utxo: &UtxoEntry) -> [u8; 32] {
+    let mut h = Blake2b256::new();
 
-    let url = format!("https://api.kaspa.org/addresses/{}/utxos", address);
+    // version
+    h.update(tx.version.to_le_bytes());
 
-    let mut opts = RequestInit::new();
-    opts.method("GET");
-    opts.mode(RequestMode::Cors);
-
-    let request = Request::new_with_str_and_init(&url, &opts)?;
-
-    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
-    let resp_value = JsFuture::from(window.fetch_with_request(&request)).await?;
-    let resp: Response = resp_value.dyn_into()?;
-
-    if !resp.ok() {
-        return Err(JsValue::from_str(&format!(
-            "fetch_utxos: HTTP {}", resp.status()
-        )));
-    }
-
-    let json = JsFuture::from(resp.json()?).await?;
-    let utxos: Vec<UtxoEntry> = serde_wasm_bindgen::from_value(json)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(utxos)
-}
-
-// ---------------------------------------------------------------------------
-// UTXO selection (largest-first)
-// ---------------------------------------------------------------------------
-
-fn select_utxos(utxos: &[UtxoEntry], required_sompi: u64) -> Result<Vec<UtxoEntry>, JsValue> {
-    let mut sorted = utxos.to_vec();
-    sorted.sort_by(|a, b| {
-        let va: u64 = a.entry.amount.parse().unwrap_or(0);
-        let vb: u64 = b.entry.amount.parse().unwrap_or(0);
-        vb.cmp(&va)
-    });
-
-    let mut selected = Vec::new();
-    let mut total: u64 = 0;
-
-    for utxo in sorted {
-        let amount: u64 = utxo.entry.amount.parse()
-            .map_err(|_| JsValue::from_str("invalid utxo amount"))?;
-        total += amount;
-        selected.push(utxo);
-        if total >= required_sompi {
-            return Ok(selected);
-        }
-    }
-
-    Err(JsValue::from_str(&format!(
-        "insufficient funds: have {} sompi, need {} sompi",
-        total, required_sompi
-    )))
-}
-
-// ---------------------------------------------------------------------------
-// Transaction building + signing
-// ---------------------------------------------------------------------------
-
-/// Kaspa sighash (SIGHASH_ALL):
-///   Blake2b-256 of the serialised transaction components
-///   Reference: https://github.com/kaspanet/kaspad/blob/master/domain/consensus/utils/transactionhelper/transaction_sighash.go
-fn kaspa_sighash(
-    tx: &KaspaTransaction,
-    input_index: usize,
-    utxo: &UtxoEntry,
-) -> [u8; 32] {
-    let mut hasher = blake2::Blake2b256::new();
-
-    // 1. version (2 bytes LE)
-    hasher.update(tx.version.to_le_bytes());
-
-    // 2. hash of all previous outpoints
-    let mut prev_hasher = blake2::Blake2b256::new();
+    // hash of all previous outpoints
+    let mut ph = Blake2b256::new();
     for inp in &tx.inputs {
-        let txid_bytes = hex::decode(&inp.previous_outpoint.transaction_id).unwrap_or_default();
-        prev_hasher.update(&txid_bytes);
-        prev_hasher.update(inp.previous_outpoint.index.to_le_bytes());
+        let txid = hex::decode(&inp.previous_outpoint.transaction_id).unwrap_or_default();
+        ph.update(&txid);
+        ph.update(inp.previous_outpoint.index.to_le_bytes());
     }
-    hasher.update(prev_hasher.finalize());
+    h.update(ph.finalize());
 
-    // 3. hash of all sequences
-    let mut seq_hasher = blake2::Blake2b256::new();
+    // hash of all sequences
+    let mut sh = Blake2b256::new();
     for inp in &tx.inputs {
-        seq_hasher.update(inp.sequence.to_le_bytes());
+        sh.update(inp.sequence.to_le_bytes());
     }
-    hasher.update(seq_hasher.finalize());
+    h.update(sh.finalize());
 
-    // 4. hash of all sigop counts
-    let mut sop_hasher = blake2::Blake2b256::new();
+    // hash of all sigop counts
+    let mut soph = Blake2b256::new();
     for inp in &tx.inputs {
-        sop_hasher.update([inp.sig_op_count]);
+        soph.update([inp.sig_op_count]);
     }
-    hasher.update(sop_hasher.finalize());
+    h.update(soph.finalize());
 
-    // 5. this input's outpoint
-    let txid_bytes = hex::decode(&tx.inputs[input_index].previous_outpoint.transaction_id)
+    // this input's outpoint
+    let txid = hex::decode(&tx.inputs[input_index].previous_outpoint.transaction_id)
         .unwrap_or_default();
-    hasher.update(&txid_bytes);
-    hasher.update(tx.inputs[input_index].previous_outpoint.index.to_le_bytes());
+    h.update(&txid);
+    h.update(tx.inputs[input_index].previous_outpoint.index.to_le_bytes());
 
-    // 6. this input's utxo script
-    let script_bytes = hex::decode(&utxo.entry.script_public_key.script).unwrap_or_default();
-    hasher.update((script_bytes.len() as u64).to_le_bytes());
-    hasher.update(&script_bytes);
+    // this input's utxo script
+    let script = hex::decode(&utxo.entry.script_public_key.script).unwrap_or_default();
+    h.update((script.len() as u64).to_le_bytes());
+    h.update(&script);
 
-    // 7. this input's utxo amount
+    // this input's utxo amount
     let amount: u64 = utxo.entry.amount.parse().unwrap_or(0);
-    hasher.update(amount.to_le_bytes());
+    h.update(amount.to_le_bytes());
 
-    // 8. this input's utxo script version
-    hasher.update(utxo.entry.script_public_key.version.to_le_bytes());
+    // this input's utxo script version
+    h.update(utxo.entry.script_public_key.version.to_le_bytes());
 
-    // 9. this input's sequence
-    hasher.update(tx.inputs[input_index].sequence.to_le_bytes());
+    // this input's sequence
+    h.update(tx.inputs[input_index].sequence.to_le_bytes());
 
-    // 10. this input's sig op count
-    hasher.update([tx.inputs[input_index].sig_op_count]);
+    // this input's sigop count
+    h.update([tx.inputs[input_index].sig_op_count]);
 
-    // 11. hash of all outputs
-    let mut out_hasher = blake2::Blake2b256::new();
+    // hash of all outputs
+    let mut oh = Blake2b256::new();
     for out in &tx.outputs {
-        out_hasher.update(out.amount.to_le_bytes());
-        out_hasher.update(out.script_public_key.version.to_le_bytes());
+        oh.update(out.amount.to_le_bytes());
+        oh.update(out.script_public_key.version.to_le_bytes());
         let sc = hex::decode(&out.script_public_key.script).unwrap_or_default();
-        out_hasher.update((sc.len() as u64).to_le_bytes());
-        out_hasher.update(&sc);
+        oh.update((sc.len() as u64).to_le_bytes());
+        oh.update(&sc);
     }
-    hasher.update(out_hasher.finalize());
+    h.update(oh.finalize());
 
-    // 12. lock time (8 bytes LE)
-    hasher.update(tx.lock_time.to_le_bytes());
+    // lock time
+    h.update(tx.lock_time.to_le_bytes());
 
-    // 13. subnetwork ID (20 bytes)
-    let subnet_bytes = hex::decode(&tx.subnetwork_id).unwrap_or_default();
-    hasher.update(&subnet_bytes);
+    // subnetwork ID (20 zero bytes for native)
+    let subnet = hex::decode(&tx.subnetwork_id).unwrap_or_default();
+    h.update(&subnet);
 
-    // 14. gas (8 bytes LE, 0 for native subnetwork)
-    hasher.update(0u64.to_le_bytes());
+    // gas (0 for native subnetwork)
+    h.update(0u64.to_le_bytes());
 
-    // 15. payload hash
-    let mut pay_hasher = blake2::Blake2b256::new();
-    pay_hasher.update([]); // empty payload for native subnetwork
-    hasher.update(pay_hasher.finalize());
+    // payload hash (empty payload)
+    let mut payh = Blake2b256::new();
+    payh.update([]);
+    h.update(payh.finalize());
 
-    // 16. sighash type (1 = SIGHASH_ALL)
-    hasher.update(1u8.to_le_bytes());
+    // sighash type (1 = SIGHASH_ALL)
+    h.update(1u8.to_le_bytes());
 
-    hasher.finalize().into()
+    h.finalize().into()
 }
 
-fn build_and_sign_transaction(
-    keypair: &KaspaKeypair,
-    selected_utxos: &[UtxoEntry],
-    params: &SendParams,
-) -> Result<KaspaTransaction, JsValue> {
+// ---------------------------------------------------------------------------
+// HTTP helpers (via IronClaw host)
+// ---------------------------------------------------------------------------
+
+fn http_get(url: &str) -> Result<Vec<u8>, String> {
+    host::log(host::LogLevel::Debug, &format!("GET {}", url));
+    let resp = host::http_request("GET", url, "{}", None, Some(30_000))
+        .map_err(|e| format!("http error: {}", e))?;
+    if resp.status < 200 || resp.status >= 300 {
+        return Err(format!("HTTP {} from {}", resp.status, url));
+    }
+    Ok(resp.body)
+}
+
+fn http_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
+    host::log(host::LogLevel::Debug, &format!("POST {}", url));
+    let headers = r#"{"Content-Type":"application/json"}"#;
+    let resp = host::http_request(
+        "POST",
+        url,
+        headers,
+        Some(body.as_bytes().to_vec()),
+        Some(30_000),
+    ).map_err(|e| format!("http error: {}", e))?;
+    if resp.status < 200 || resp.status >= 300 {
+        let body_str = String::from_utf8_lossy(&resp.body).to_string();
+        return Err(format!("HTTP {} from {}: {}", resp.status, url, body_str));
+    }
+    Ok(resp.body)
+}
+
+// ---------------------------------------------------------------------------
+// Core send logic
+// ---------------------------------------------------------------------------
+
+fn send_kas(params: &SendParams, mnemonic: &str) -> Result<TxResult, String> {
+    // 1. Derive keypair
+    let keypair = derive_kaspa_keypair(mnemonic)?;
+    host::log(host::LogLevel::Info, &format!("sender address: {}", keypair.address));
+
+    // 2. Fetch UTXOs
+    let url = format!("https://api.kaspa.org/addresses/{}/utxos", keypair.address);
+    let body = http_get(&url)?;
+    let utxos: Vec<UtxoEntry> = serde_json::from_slice(&body)
+        .map_err(|e| format!("parse utxos: {}", e))?;
+
+    if utxos.is_empty() {
+        return Err("no UTXOs found for address".into());
+    }
+
+    // 3. Select UTXOs
     let amount_sompi = (params.amount_kas * 100_000_000.0) as u64;
-    let fee = params.priority_fee_sompi;
-    let total_input: u64 = selected_utxos.iter()
+    let required = amount_sompi + params.priority_fee_sompi;
+    let selected = select_utxos(&utxos, required)?;
+
+    // 4. Build transaction (unsigned)
+    let total_input: u64 = selected.iter()
         .map(|u| u.entry.amount.parse::<u64>().unwrap_or(0))
         .sum();
-    let change = total_input
-        .checked_sub(amount_sompi + fee)
-        .ok_or_else(|| JsValue::from_str("arithmetic overflow on change calculation"))?;
+    let change = total_input.checked_sub(required)
+        .ok_or("arithmetic overflow calculating change")?;
 
-    // Build inputs (signature scripts filled in after signing)
-    let inputs: Vec<KaspaTransactionInput> = selected_utxos.iter().map(|u| {
-        KaspaTransactionInput {
-            previous_outpoint: PreviousOutpoint {
-                transaction_id: u.outpoint.transaction_id.clone(),
-                index: u.outpoint.index,
-            },
-            signature_script: String::new(), // filled after signing
-            sequence: 0,
-            sig_op_count: 1,
-        }
-    }).collect();
-
-    // Build outputs
     let (_, recipient_script) = address_to_script(&params.recipient)?;
-    let mut outputs = vec![
-        KaspaTransactionOutput {
-            amount: amount_sompi,
-            script_public_key: ScriptPublicKeyOut {
-                version: 0,
-                script: recipient_script,
-            },
-        },
-    ];
 
-    // Only add change output if it covers minimum dust threshold (1000 sompi)
-    if change >= 1000 {
-        outputs.push(KaspaTransactionOutput {
+    let mut outputs = vec![TxOutput {
+        amount: amount_sompi,
+        script_public_key: ScriptPublicKeyOut { version: 0, script: recipient_script },
+    }];
+    if change >= 1_000 {
+        outputs.push(TxOutput {
             amount: change,
             script_public_key: ScriptPublicKeyOut {
                 version: 0,
@@ -553,112 +478,130 @@ fn build_and_sign_transaction(
         });
     }
 
-    // Native subnetwork ID = 20 zero bytes
-    let subnetwork_id = "0000000000000000000000000000000000000000".to_string();
+    let inputs: Vec<TxInput> = selected.iter().map(|u| TxInput {
+        previous_outpoint: PreviousOutpoint {
+            transaction_id: u.outpoint.transaction_id.clone(),
+            index: u.outpoint.index,
+        },
+        signature_script: String::new(),
+        sequence: 0,
+        sig_op_count: 1,
+    }).collect();
 
-    let mut tx = KaspaTransaction {
+    let mut tx = KaspaTx {
         version: 0,
         inputs,
         outputs,
         lock_time: 0,
-        subnetwork_id,
+        subnetwork_id: "0000000000000000000000000000000000000000".into(),
     };
 
-    // Sign each input
+    // 5. Sign each input
     let secp = Secp256k1::new();
-    for i in 0..selected_utxos.len() {
-        let sighash = kaspa_sighash(&tx, i, &selected_utxos[i]);
-        let msg = Message::from_digest(sighash);
-        // Schnorr signature
-        let keypair_obj = secp256k1::Keypair::from_secret_key(&secp, &keypair.secret_key);
-        let sig = secp.sign_schnorr(&msg, &keypair_obj);
-        // signature_script: <sig_len> <sig_bytes> (64 bytes Schnorr)
+    let kp = secp256k1::Keypair::from_secret_key(&secp, &keypair.secret_key);
+    for i in 0..selected.len() {
+        let hash = kaspa_sighash(&tx, i, &selected[i]);
+        let msg = Message::from_digest(hash);
+        let sig = secp.sign_schnorr(&msg, &kp);
         let sig_bytes = sig.as_ref();
         let mut script = vec![sig_bytes.len() as u8];
         script.extend_from_slice(sig_bytes);
         tx.inputs[i].signature_script = hex::encode(script);
     }
 
-    Ok(tx)
+    // 6. Broadcast
+    let req = SubmitTxRequest { transaction: tx, allow_orphan: false };
+    let payload = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    let resp_body = http_post_json("https://api.kaspa.org/transactions", &payload)?;
+    let resp: SubmitTxResponse = serde_json::from_slice(&resp_body)
+        .map_err(|e| format!("parse broadcast response: {}", e))?;
+
+    Ok(TxResult { txid: resp.transaction_id, status: "submitted".into() })
+}
+
+fn select_utxos(utxos: &[UtxoEntry], required: u64) -> Result<Vec<UtxoEntry>, String> {
+    let mut sorted = utxos.to_vec();
+    sorted.sort_by(|a, b| {
+        let va: u64 = a.entry.amount.parse().unwrap_or(0);
+        let vb: u64 = b.entry.amount.parse().unwrap_or(0);
+        vb.cmp(&va)
+    });
+    let mut selected = Vec::new();
+    let mut total: u64 = 0;
+    for utxo in sorted {
+        let amount: u64 = utxo.entry.amount.parse()
+            .map_err(|_| "invalid utxo amount")?;
+        total += amount;
+        selected.push(utxo);
+        if total >= required {
+            return Ok(selected);
+        }
+    }
+    Err(format!("insufficient funds: have {} sompi, need {} sompi", total, required))
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast
+// IronClaw tool implementation
 // ---------------------------------------------------------------------------
 
-async fn broadcast_transaction(tx: KaspaTransaction) -> Result<String, JsValue> {
-    use web_sys::{Request, RequestInit, RequestMode, Response};
-    use wasm_bindgen::JsCast;
+struct Component;
 
-    let body = serde_json::to_string(&SubmitTxRequest {
-        transaction: tx,
-        allow_orphan: false,
-    }).map_err(|e| JsValue::from_str(&e.to_string()))?;
+impl Guest for Component {
+    fn execute(req: Request) -> Response {
+        // Read mnemonic from environment (IronClaw injects vault secrets as env vars)
+        let mnemonic = match std::env::var("KASPA_MNEMONIC") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Response {
+                output: None,
+                error: Some("KASPA_MNEMONIC is not set. Run: ironclaw tool setup kaspa_send".into()),
+            },
+        };
 
-    let mut opts = RequestInit::new();
-    opts.method("POST");
-    opts.mode(RequestMode::Cors);
-    opts.body(Some(&JsValue::from_str(&body)));
+        let params: SendParams = match serde_json::from_str(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response {
+                output: None,
+                error: Some(format!("invalid params: {}", e)),
+            },
+        };
 
-    let request = Request::new_with_str_and_init("https://api.kaspa.org/transactions", &opts)?;
-    request.headers().set("Content-Type", "application/json")?;
-
-    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
-    let resp_value = JsFuture::from(window.fetch_with_request(&request)).await?;
-    let resp: Response = resp_value.dyn_into()?;
-
-    if !resp.ok() {
-        let text = JsFuture::from(resp.text()?).await?;
-        return Err(JsValue::from_str(&format!(
-            "broadcast failed (HTTP {}): {}",
-            resp.status(),
-            text.as_string().unwrap_or_default()
-        )));
+        match send_kas(&params, &mnemonic) {
+            Ok(result) => Response {
+                output: Some(serde_json::to_string(&result).unwrap()),
+                error: None,
+            },
+            Err(e) => Response {
+                output: None,
+                error: Some(e),
+            },
+        }
     }
 
-    let json = JsFuture::from(resp.json()?).await?;
-    let result: SubmitTxResponse = serde_wasm_bindgen::from_value(json)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    Ok(result.transaction_id)
-}
-
-// ---------------------------------------------------------------------------
-// Main entry point (called by IronClaw host)
-// ---------------------------------------------------------------------------
-
-/// Send KAS tokens.
-///
-/// # Arguments
-/// * `params_json` — JSON-serialised `SendParams`
-/// * `mnemonic`    — BIP39 mnemonic injected by IronClaw from the encrypted vault;
-///                   this value never leaves the WASM sandbox.
-#[wasm_bindgen]
-pub async fn kaspa_send(params_json: &str, mnemonic: &str) -> Result<String, JsValue> {
-    let params: SendParams = serde_json::from_str(params_json)
-        .map_err(|e| JsValue::from_str(&format!("invalid params: {}", e)))?;
-
-    // 1. Derive keypair
-    let keypair = derive_kaspa_keypair(mnemonic)?;
-
-    // 2. Fetch UTXOs
-    let utxos = fetch_utxos(&keypair.address).await?;
-
-    if utxos.is_empty() {
-        return Err(JsValue::from_str("no UTXOs found for address"));
+    fn schema() -> String {
+        r#"{
+  "type": "object",
+  "required": ["recipient", "amount_kas"],
+  "properties": {
+    "recipient": {
+      "type": "string",
+      "description": "Kaspa recipient address (kaspa:q...)"
+    },
+    "amount_kas": {
+      "type": "number",
+      "description": "Amount to send in KAS (1 KAS = 100000000 sompi)"
+    },
+    "priority_fee_sompi": {
+      "type": "integer",
+      "description": "Optional miner tip in sompi (default 0)",
+      "default": 0
+    }
+  }
+}"#.into()
     }
 
-    // 3. Select UTXOs
-    let amount_sompi = (params.amount_kas * 100_000_000.0) as u64;
-    let required = amount_sompi + params.priority_fee_sompi;
-    let selected = select_utxos(&utxos, required)?;
-
-    // 4. Build + sign transaction
-    let signed_tx = build_and_sign_transaction(&keypair, &selected, &params)?;
-
-    // 5. Broadcast
-    let txid = broadcast_transaction(signed_tx).await?;
-
-    let result = TxResult { txid, status: "submitted".into() };
-    Ok(serde_json::to_string(&result).unwrap())
+    fn description() -> String {
+        "Send KAS tokens on the Kaspa blockchain. Requires KASPA_MNEMONIC secret to be configured.".into()
+    }
 }
+
+bindings::export!(Component with_types_in bindings);

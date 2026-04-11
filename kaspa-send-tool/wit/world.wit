@@ -1,0 +1,6 @@
+package kaspa:send@0.1.0;
+
+world kaspa-send-world {
+  import near:agent/host@0.3.0;
+  export near:agent/tool@0.3.0;
+}
