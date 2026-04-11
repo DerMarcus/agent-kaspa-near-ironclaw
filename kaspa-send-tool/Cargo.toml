@@ -31,7 +31,7 @@ hmac = "0.12"
 sha2 = "0.10"
 
 [package.metadata.component]
-package = "kaspa:send@0.1.0"
+package = "kaspa:send"
 
 [profile.release]
 opt-level = "s"
