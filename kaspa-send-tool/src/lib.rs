@@ -6,7 +6,12 @@ use bindings::near::agent::host;
 
 use serde::{Deserialize, Serialize};
 use blake2::{Blake2b256, Digest};
-use secp256k1::{Secp256k1, SecretKey, PublicKey, Message};
+use k256::{
+    Scalar, FieldBytes,
+    elliptic_curve::{PrimeField, ops::Reduce},
+    schnorr::{SigningKey, Signature},
+    schnorr::signature::Signer,
+};
 use bip39::Mnemonic;
 use std::str::FromStr;
 
@@ -117,12 +122,11 @@ struct SubmitTxResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Keypair
+// Keypair — we carry the 32-byte secret (x-only compatible) and the Schnorr key
 // ---------------------------------------------------------------------------
 
 struct KaspaKeypair {
-    secret_key: SecretKey,
-    public_key: PublicKey,
+    signing_key: SigningKey,
     address: String,
 }
 
@@ -135,10 +139,9 @@ const CHARSET: [char; 32] = [
     's','3','j','n','5','4','k','h','c','e','6','m','u','a','7','l',
 ];
 
-fn encode_kaspa_address(pubkey: &PublicKey) -> String {
-    let xonly = &pubkey.serialize()[1..]; // 32-byte x-only
+fn encode_kaspa_address(xonly_pubkey: &[u8; 32]) -> String {
     let mut payload = vec![0u8]; // version 0 = P2PK Schnorr
-    payload.extend_from_slice(xonly);
+    payload.extend_from_slice(xonly_pubkey);
     let b32 = to_base32(&payload);
     let checksum = kaspa_checksum("kaspa", &b32);
     let mut chars: Vec<char> = b32.iter().map(|b| CHARSET[*b as usize]).collect();
@@ -195,10 +198,10 @@ fn polymod_step(pre: u64) -> u64 {
 // P2PK script helpers
 // ---------------------------------------------------------------------------
 
-fn p2pk_script(pubkey: &PublicKey) -> String {
+fn p2pk_script(xonly: &[u8; 32]) -> String {
     // 0x20 <32-byte xonly> 0xac
     let mut script = vec![0x20u8];
-    script.extend_from_slice(&pubkey.serialize()[1..]);
+    script.extend_from_slice(xonly);
     script.push(0xac);
     hex::encode(script)
 }
@@ -208,7 +211,7 @@ fn address_to_script(address: &str) -> Result<(u16, String), String> {
         .strip_prefix("kaspa:")
         .ok_or("invalid address: missing kaspa: prefix")?;
 
-    let b32: Result<Vec<u8>, _> = addr
+    let b32: Result<Vec<u8>, String> = addr
         .chars()
         .map(|c| {
             CHARSET.iter().position(|&x| x == c)
@@ -249,46 +252,58 @@ fn address_to_script(address: &str) -> Result<(u16, String), String> {
 
 // ---------------------------------------------------------------------------
 // BIP32 key derivation  (m/44'/111111'/0'/0/0  — Kaspa coin type 111111)
+// Uses k256 scalars — pure Rust, no C dependency.
 // ---------------------------------------------------------------------------
 
 fn derive_kaspa_keypair(mnemonic_phrase: &str) -> Result<KaspaKeypair, String> {
     let mnemonic = Mnemonic::from_str(mnemonic_phrase)
         .map_err(|e| format!("invalid mnemonic: {}", e))?;
     let seed = mnemonic.to_seed("");
-    let secret_key = derive_bip32_key(&seed)?;
-    let secp = Secp256k1::new();
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let address = encode_kaspa_address(&public_key);
-    Ok(KaspaKeypair { secret_key, public_key, address })
+    let key_bytes = derive_bip32_key(&seed)?;
+
+    // k256 schnorr SigningKey uses the raw 32-byte secret
+    let signing_key = SigningKey::from_bytes(&key_bytes)
+        .map_err(|e| format!("invalid derived key: {}", e))?;
+
+    // X-only public key (32 bytes)
+    let xonly: [u8; 32] = signing_key.verifying_key().to_bytes().into();
+    let address = encode_kaspa_address(&xonly);
+
+    Ok(KaspaKeypair { signing_key, address })
 }
 
-fn derive_bip32_key(seed: &[u8]) -> Result<SecretKey, String> {
+/// BIP32 child key derivation — returns raw 32-byte secret scalar for path
+/// m/44'/111111'/0'/0/0
+fn derive_bip32_key(seed: &[u8]) -> Result<[u8; 32], String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
     type HmacSha512 = Hmac<Sha512>;
 
+    // Master key from seed
     let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed")
         .map_err(|e| e.to_string())?;
     mac.update(seed);
     let result = mac.finalize().into_bytes();
-    let (mut key_bytes, mut chain_code): ([u8; 32], [u8; 32]) = (
-        result[..32].try_into().unwrap(),
-        result[32..].try_into().unwrap(),
-    );
+    let mut key_bytes: [u8; 32] = result[..32].try_into().unwrap();
+    let mut chain_code: [u8; 32] = result[32..].try_into().unwrap();
 
     // m/44'/111111'/0'/0/0
     let path: &[u32] = &[0x8000_002C, 0x8001_B207, 0x8000_0000, 0, 0];
-    let secp = Secp256k1::new();
 
     for &index in path {
         let mut data = Vec::with_capacity(37);
         if index >= 0x8000_0000 {
-            data.push(0x00);
+            // Hardened: 0x00 || private_key
+            data.push(0x00u8);
             data.extend_from_slice(&key_bytes);
         } else {
-            let sk = SecretKey::from_slice(&key_bytes).map_err(|e| e.to_string())?;
-            let pk = PublicKey::from_secret_key(&secp, &sk);
-            data.extend_from_slice(&pk.serialize());
+            // Normal: compressed public key
+            let sk = SigningKey::from_bytes(&key_bytes)
+                .map_err(|e| format!("bip32 key error: {}", e))?;
+            // Uncompressed pubkey from schnorr verifying key = 02 || xonly
+            let xonly: [u8; 32] = sk.verifying_key().to_bytes().into();
+            data.push(0x02); // even parity (Schnorr convention)
+            data.extend_from_slice(&xonly);
         }
         data.extend_from_slice(&index.to_be_bytes());
 
@@ -300,15 +315,26 @@ fn derive_bip32_key(seed: &[u8]) -> Result<SecretKey, String> {
         let il: [u8; 32] = child_result[..32].try_into().unwrap();
         chain_code = child_result[32..].try_into().unwrap();
 
-        let child_sk = SecretKey::from_slice(&il).map_err(|e| e.to_string())?;
-        let parent_sk = SecretKey::from_slice(&key_bytes).map_err(|e| e.to_string())?;
-        let tweaked = child_sk.add_tweak(
-            &secp256k1::Scalar::from_be_bytes(parent_sk.secret_bytes()).unwrap()
-        ).map_err(|e| e.to_string())?;
-        key_bytes = tweaked.secret_bytes();
+        // child_key = parse256(IL) + parent_key  (mod n)
+        // Use k256 Scalar arithmetic (pure Rust)
+        let il_scalar = Scalar::from_repr(*FieldBytes::from_slice(&il))
+            .into_option()
+            .ok_or("BIP32: IL >= order")?;
+        let parent_scalar = Scalar::from_repr(*FieldBytes::from_slice(&key_bytes))
+            .into_option()
+            .ok_or("BIP32: parent key invalid")?;
+
+        let child_scalar = il_scalar + parent_scalar;
+
+        // Check child is not zero
+        if child_scalar.is_zero().into() {
+            return Err("BIP32: derived zero key (astronomically unlikely, retry with next index)".into());
+        }
+
+        key_bytes = child_scalar.to_bytes().into();
     }
 
-    SecretKey::from_slice(&key_bytes).map_err(|e| e.to_string())
+    Ok(key_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,10 +344,8 @@ fn derive_bip32_key(seed: &[u8]) -> Result<SecretKey, String> {
 fn kaspa_sighash(tx: &KaspaTx, input_index: usize, utxo: &UtxoEntry) -> [u8; 32] {
     let mut h = Blake2b256::new();
 
-    // version
     h.update(tx.version.to_le_bytes());
 
-    // hash of all previous outpoints
     let mut ph = Blake2b256::new();
     for inp in &tx.inputs {
         let txid = hex::decode(&inp.previous_outpoint.transaction_id).unwrap_or_default();
@@ -330,45 +354,33 @@ fn kaspa_sighash(tx: &KaspaTx, input_index: usize, utxo: &UtxoEntry) -> [u8; 32]
     }
     h.update(ph.finalize());
 
-    // hash of all sequences
     let mut sh = Blake2b256::new();
     for inp in &tx.inputs {
         sh.update(inp.sequence.to_le_bytes());
     }
     h.update(sh.finalize());
 
-    // hash of all sigop counts
     let mut soph = Blake2b256::new();
     for inp in &tx.inputs {
         soph.update([inp.sig_op_count]);
     }
     h.update(soph.finalize());
 
-    // this input's outpoint
     let txid = hex::decode(&tx.inputs[input_index].previous_outpoint.transaction_id)
         .unwrap_or_default();
     h.update(&txid);
     h.update(tx.inputs[input_index].previous_outpoint.index.to_le_bytes());
 
-    // this input's utxo script
     let script = hex::decode(&utxo.entry.script_public_key.script).unwrap_or_default();
     h.update((script.len() as u64).to_le_bytes());
     h.update(&script);
 
-    // this input's utxo amount
     let amount: u64 = utxo.entry.amount.parse().unwrap_or(0);
     h.update(amount.to_le_bytes());
-
-    // this input's utxo script version
     h.update(utxo.entry.script_public_key.version.to_le_bytes());
-
-    // this input's sequence
     h.update(tx.inputs[input_index].sequence.to_le_bytes());
-
-    // this input's sigop count
     h.update([tx.inputs[input_index].sig_op_count]);
 
-    // hash of all outputs
     let mut oh = Blake2b256::new();
     for out in &tx.outputs {
         oh.update(out.amount.to_le_bytes());
@@ -379,23 +391,17 @@ fn kaspa_sighash(tx: &KaspaTx, input_index: usize, utxo: &UtxoEntry) -> [u8; 32]
     }
     h.update(oh.finalize());
 
-    // lock time
     h.update(tx.lock_time.to_le_bytes());
 
-    // subnetwork ID (20 zero bytes for native)
     let subnet = hex::decode(&tx.subnetwork_id).unwrap_or_default();
     h.update(&subnet);
-
-    // gas (0 for native subnetwork)
     h.update(0u64.to_le_bytes());
 
-    // payload hash (empty payload)
     let mut payh = Blake2b256::new();
     payh.update([]);
     h.update(payh.finalize());
 
-    // sighash type (1 = SIGHASH_ALL)
-    h.update(1u8.to_le_bytes());
+    h.update(1u8.to_le_bytes()); // SIGHASH_ALL
 
     h.finalize().into()
 }
@@ -436,11 +442,12 @@ fn http_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
 // ---------------------------------------------------------------------------
 
 fn send_kas(params: &SendParams, mnemonic: &str) -> Result<TxResult, String> {
-    // 1. Derive keypair
     let keypair = derive_kaspa_keypair(mnemonic)?;
-    host::log(host::LogLevel::Info, &format!("sender address: {}", keypair.address));
+    let xonly: [u8; 32] = keypair.signing_key.verifying_key().to_bytes().into();
 
-    // 2. Fetch UTXOs
+    host::log(host::LogLevel::Info, &format!("sender: {}", keypair.address));
+
+    // Fetch UTXOs
     let url = format!("https://api.kaspa.org/addresses/{}/utxos", keypair.address);
     let body = http_get(&url)?;
     let utxos: Vec<UtxoEntry> = serde_json::from_slice(&body)
@@ -450,12 +457,10 @@ fn send_kas(params: &SendParams, mnemonic: &str) -> Result<TxResult, String> {
         return Err("no UTXOs found for address".into());
     }
 
-    // 3. Select UTXOs
     let amount_sompi = (params.amount_kas * 100_000_000.0) as u64;
     let required = amount_sompi + params.priority_fee_sompi;
     let selected = select_utxos(&utxos, required)?;
 
-    // 4. Build transaction (unsigned)
     let total_input: u64 = selected.iter()
         .map(|u| u.entry.amount.parse::<u64>().unwrap_or(0))
         .sum();
@@ -473,7 +478,7 @@ fn send_kas(params: &SendParams, mnemonic: &str) -> Result<TxResult, String> {
             amount: change,
             script_public_key: ScriptPublicKeyOut {
                 version: 0,
-                script: p2pk_script(&keypair.public_key),
+                script: p2pk_script(&xonly),
             },
         });
     }
@@ -496,20 +501,18 @@ fn send_kas(params: &SendParams, mnemonic: &str) -> Result<TxResult, String> {
         subnetwork_id: "0000000000000000000000000000000000000000".into(),
     };
 
-    // 5. Sign each input
-    let secp = Secp256k1::new();
-    let kp = secp256k1::Keypair::from_secret_key(&secp, &keypair.secret_key);
+    // Sign each input with BIP340 Schnorr over the Blake2b-256 sighash
     for i in 0..selected.len() {
-        let hash = kaspa_sighash(&tx, i, &selected[i]);
-        let msg = Message::from_digest(hash);
-        let sig = secp.sign_schnorr(&msg, &kp);
-        let sig_bytes = sig.as_ref();
+        let sighash = kaspa_sighash(&tx, i, &selected[i]);
+        let sig: Signature = keypair.signing_key.sign(&sighash);
+        let sig_bytes = sig.to_bytes();
+        // signature_script: <sig_len(1 byte)> <sig(64 bytes)>
         let mut script = vec![sig_bytes.len() as u8];
-        script.extend_from_slice(sig_bytes);
+        script.extend_from_slice(&sig_bytes);
         tx.inputs[i].signature_script = hex::encode(script);
     }
 
-    // 6. Broadcast
+    // Broadcast
     let req = SubmitTxRequest { transaction: tx, allow_orphan: false };
     let payload = serde_json::to_string(&req).map_err(|e| e.to_string())?;
     let resp_body = http_post_json("https://api.kaspa.org/transactions", &payload)?;
@@ -541,19 +544,18 @@ fn select_utxos(utxos: &[UtxoEntry], required: u64) -> Result<Vec<UtxoEntry>, St
 }
 
 // ---------------------------------------------------------------------------
-// IronClaw tool implementation
+// IronClaw tool interface
 // ---------------------------------------------------------------------------
 
 struct Component;
 
 impl Guest for Component {
     fn execute(req: Request) -> Response {
-        // Read mnemonic from environment (IronClaw injects vault secrets as env vars)
         let mnemonic = match std::env::var("KASPA_MNEMONIC") {
             Ok(v) if !v.is_empty() => v,
             _ => return Response {
                 output: None,
-                error: Some("KASPA_MNEMONIC is not set. Run: ironclaw tool setup kaspa_send".into()),
+                error: Some("KASPA_MNEMONIC not set — run: ironclaw tool setup kaspa_send".into()),
             },
         };
 
@@ -600,7 +602,7 @@ impl Guest for Component {
     }
 
     fn description() -> String {
-        "Send KAS tokens on the Kaspa blockchain. Requires KASPA_MNEMONIC secret to be configured.".into()
+        "Send KAS tokens on the Kaspa blockchain. Requires KASPA_MNEMONIC secret.".into()
     }
 }
 
