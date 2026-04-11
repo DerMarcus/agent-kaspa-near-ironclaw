@@ -1,0 +1,11 @@
+[[endpoints]]
+name        = "kaspa-rest-api"
+base_url    = "https://api.kaspa.org"
+allowed_paths = [
+  "/addresses/*/utxos",
+  "/addresses/*/balance",
+  "/transactions",
+  "/info/virtual-chain-blue-score",
+]
+# Signing happens inside the WASM sandbox; no secret is injected via HTTP header
+inject_secret = false

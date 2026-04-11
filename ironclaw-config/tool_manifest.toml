@@ -1,0 +1,17 @@
+[tool]
+name        = "kaspa_send"
+version     = "0.1.0"
+description = "Send KAS tokens on the Kaspa blockchain via a TEE-sandboxed WASM tool"
+wasm_path   = "../kaspa-send-tool/pkg/kaspa_send_tool_bg.wasm"
+
+[permissions]
+http    = true                  # requires calls to api.kaspa.org
+secrets = ["KASPA_MNEMONIC"]   # vault secret injected at the call boundary
+
+[http]
+allowed_origins = ["https://api.kaspa.org"]
+
+[input_schema]
+recipient           = "string"   # kaspa:q… address
+amount_kas          = "float"    # amount in KAS (1 KAS = 100 000 000 sompi)
+priority_fee_sompi  = "integer"  # optional miner tip in sompi (default 0)
