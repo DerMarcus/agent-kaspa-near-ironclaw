@@ -33,8 +33,5 @@ sha2 = "0.10"
 [package.metadata.component]
 package = "kaspa:send@0.1.0"
 
-[package.metadata.component.target]
-world = "kaspa-send-world"
-
 [profile.release]
 opt-level = "s"
