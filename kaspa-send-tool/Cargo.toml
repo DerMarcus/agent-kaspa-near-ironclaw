@@ -33,5 +33,11 @@ sha2 = "0.10"
 [package.metadata.component]
 package = "kaspa:send"
 
+[package.metadata.component.target]
+world = "kaspa-send-world"
+
+[package.metadata.component.target.dependencies]
+"near:agent" = { path = "wit/deps/near-agent" }
+
 [profile.release]
 opt-level = "s"
