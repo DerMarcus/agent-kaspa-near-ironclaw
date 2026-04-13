@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # WIT bindgen — cargo-component auto-generates bindings.rs that uses wit_bindgen_rt
 wit-bindgen = { version = "0.36", features = ["realloc"] }
-wit-bindgen-rt = { version = "0.36", features = ["realloc"] }
+wit-bindgen-rt = "0.36"
 
 # Serialisation
 serde = { version = "1", features = ["derive"] }
