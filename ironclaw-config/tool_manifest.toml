@@ -2,7 +2,7 @@
 name        = "kaspa_send"
 version     = "0.1.0"
 description = "Send KAS tokens on the Kaspa blockchain via a TEE-sandboxed WASM tool"
-wasm_path   = "../kaspa-send-tool/pkg/kaspa_send_tool_bg.wasm"
+wasm_path   = "../kaspa-send-tool/target/wasm32-wasip1/release/kaspa_send_tool.wasm"
 
 [permissions]
 http    = true                  # requires calls to api.kaspa.org
